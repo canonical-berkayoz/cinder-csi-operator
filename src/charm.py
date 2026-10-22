@@ -48,6 +48,7 @@ class CinderCSICharm(ops.CharmBase):
         self.framework.observe(self.on.kube_control_relation_created, self._kube_control)
         self.framework.observe(self.on.kube_control_relation_joined, self._kube_control)
         self.framework.observe(self.on.kube_control_relation_changed, self._merge_config)
+        self.framework.observe(self.on.kube_control_relation_departed, self._merge_config)
         self.framework.observe(self.on.kube_control_relation_broken, self._merge_config)
 
         self.framework.observe(self.on.certificates_relation_created, self._merge_config)
@@ -102,11 +103,35 @@ class CinderCSICharm(ops.CharmBase):
             msg = "Failed to apply missing resources. API Server unavailable."
             event.set_results({"result": msg})
 
+    def _refresh_kubeconfig(self) -> None:
+        """Rewrite the kubeconfig from the current kube-control data, if it is usable.
+
+        Control-plane units can be replaced without this unit seeing a relation-changed
+        event, which would leave the kubeconfig pointing at a removed node.
+        """
+        try:
+            if not self.kube_control.is_ready:
+                return
+            if not self.kube_control.get_auth_credentials(self.unit.name):
+                return
+            self.kube_control.create_kubeconfig(
+                self._ca_cert_path, self._kubeconfig_path, "root", self.unit.name
+            )
+        except (FileNotFoundError, ops.ModelError) as e:
+            log.warning("Unable to refresh kubeconfig from kube-control: %s", e)
+
     def _update_status(self, _):
         if not self.stored.deployed:
             return
 
-        unready = self.collector.unready
+        self._refresh_kubeconfig()
+
+        try:
+            unready = self.collector.unready
+        except ManifestClientError as e:
+            log.warning("Kubernetes API unreachable while checking resource readiness: %s", e)
+            self.unit.status = ops.WaitingStatus("Waiting for kube-apiserver")
+            return
         if unready:
             self.unit.status = ops.WaitingStatus(", ".join(unready))
         else:

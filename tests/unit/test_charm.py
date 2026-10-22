@@ -6,9 +6,11 @@
 import unittest.mock as mock
 from pathlib import Path
 
+import httpx
 import pytest
 import yaml
-from ops.model import BlockedStatus, MaintenanceStatus, WaitingStatus
+from ops.manifests import ManifestClientError
+from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, WaitingStatus
 from ops.testing import Harness
 
 from charm import CinderCSICharm
@@ -171,3 +173,93 @@ def test_waits_for_kube_control(mock_create_kubeconfig, harness, caplog):
     }
 
     caplog.clear()
+
+
+@pytest.fixture()
+def deployed_charm(harness):
+    harness.set_leader(True)
+    harness.begin()
+    charm = harness.charm
+    charm.stored.deployed = True
+    charm.collector = mock.MagicMock()
+    charm.collector.unready = []
+    charm.collector.short_version = "1.0"
+    charm.collector.long_version = "cinder-csi 1.0"
+    return charm
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ManifestClientError(
+            "Failed to load in cluster CRDs", httpx.ConnectError("No route to host")
+        ),
+    ],
+)
+def test_update_status_waits_when_api_unreachable(deployed_charm, error, caplog):
+    type(deployed_charm.collector).unready = mock.PropertyMock(side_effect=error)
+
+    deployed_charm._update_status(None)
+
+    assert deployed_charm.unit.status == WaitingStatus("Waiting for kube-apiserver")
+    assert any("Kubernetes API unreachable" in r.message for r in caplog.records)
+
+
+def test_update_status_active_when_ready(deployed_charm):
+    deployed_charm._update_status(None)
+
+    assert deployed_charm.unit.status == ActiveStatus("Ready")
+
+
+def test_update_status_refreshes_kubeconfig_from_kube_control(deployed_charm):
+    """update-status must pick up a changed API endpoint without a relation event."""
+    kube_control = mock.MagicMock()
+    kube_control.is_ready = True
+    kube_control.get_auth_credentials.return_value = {"client_token": "abc"}
+    deployed_charm.kube_control = kube_control
+
+    deployed_charm._update_status(None)
+
+    kube_control.create_kubeconfig.assert_called_once_with(
+        deployed_charm._ca_cert_path,
+        deployed_charm._kubeconfig_path,
+        "root",
+        deployed_charm.unit.name,
+    )
+
+
+@pytest.mark.parametrize("ready, creds", [(False, None), (True, None)])
+def test_update_status_skips_kubeconfig_refresh_without_usable_data(deployed_charm, ready, creds):
+    kube_control = mock.MagicMock()
+    kube_control.is_ready = ready
+    kube_control.get_auth_credentials.return_value = creds
+    deployed_charm.kube_control = kube_control
+
+    deployed_charm._update_status(None)
+
+    kube_control.create_kubeconfig.assert_not_called()
+    assert deployed_charm.unit.status == ActiveStatus("Ready")
+
+
+def test_update_status_survives_kubeconfig_refresh_failure(deployed_charm, caplog):
+    kube_control = mock.MagicMock()
+    kube_control.is_ready = True
+    kube_control.get_auth_credentials.return_value = {"client_token": "abc"}
+    kube_control.create_kubeconfig.side_effect = FileNotFoundError("No CA certificate found")
+    deployed_charm.kube_control = kube_control
+
+    deployed_charm._update_status(None)
+
+    assert any("Unable to refresh kubeconfig" in r.message for r in caplog.records)
+
+
+def test_kube_control_departed_reevaluates_kubeconfig(harness):
+    with mock.patch.object(CinderCSICharm, "_merge_config", autospec=True) as merge_config:
+        harness.begin()
+        rel_id = harness.add_relation("kube-control", "kubernetes-control-plane")
+        harness.add_relation_unit(rel_id, "kubernetes-control-plane/0")
+        merge_config.reset_mock()
+
+        harness.remove_relation_unit(rel_id, "kubernetes-control-plane/0")
+
+    merge_config.assert_called_once()
